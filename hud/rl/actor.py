@@ -25,7 +25,6 @@ class Actor:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.actor_config = config.actor
-        self.current_adapter = config.model.base_model
         
         # Setup OpenAI client for vLLM
         base_url = self.actor_config.vllm_base_url.replace("localhost", "127.0.0.1")
@@ -33,11 +32,8 @@ class Actor:
     
     def _create_openai_client(self, base_url: str) -> AsyncOpenAI:
         """Create OpenAI client with optimized settings for vLLM."""
-        # Match connection limits to parallel_episodes to avoid bottlenecks
-        max_parallel = self.actor_config.max_parallel_episodes
-        # Use shorter per-request timeout and keep retries modest to avoid long blocking
         http_client = create_retry_httpx_client(
-            timeout=httpx.Timeout(30.0),
+            timeout=httpx.Timeout(self.actor_config.request_timeout),   
         )
         return AsyncOpenAI(
             base_url=base_url,
@@ -50,10 +46,9 @@ class Actor:
         """Create an agent with the current adapter."""
         return GenericOpenAIChatAgent(
             openai_client=self.openai_client,
-            model_name=self.current_adapter,
+            model_name=self.config.model.base_model,
             allowed_tools=self.actor_config.allowed_tools,
             append_setup_output=False,
-            system_prompt=self.actor_config.system_prompt,
             verbose=self.config.verbose,
             completion_kwargs={
                 "temperature": self.actor_config.temperature,
@@ -62,43 +57,40 @@ class Actor:
             }
         )
     
-    def update_adapter(self, adapter_name: str) -> None:
-        """Update the current adapter being used."""
-        self.current_adapter = adapter_name
-        hud_console.info(f"[Actor] Using adapter: {adapter_name}")
-    
     async def run_tasks(self, tasks: list[Task], job_id: str) -> list[Trace]:
-        """Run tasks and collect traces."""
-        traces = []
+        """Run tasks and collect traces using semaphore for concurrency control."""
+        # Create semaphore to limit concurrent episodes
+        semaphore = asyncio.Semaphore(self.actor_config.max_parallel_episodes)
         
-        # Process tasks in batches respecting max_parallel_episodes limit
-        for batch_start in range(0, len(tasks), self.actor_config.max_parallel_episodes):
-            batch_end = min(batch_start + self.actor_config.max_parallel_episodes, len(tasks))
-            batch = tasks[batch_start:batch_end]
-
-            # Run batch in parallel with per-episode timeout protection
-            async def run_with_timeout(t: Task) -> Trace:
+        async def run_with_semaphore(task: Task) -> Trace:
+            """Run a single task with semaphore and timeout protection."""
+            async with semaphore:
                 try:
                     return await asyncio.wait_for(
-                        self._run_task(t, job_id),
+                        self._run_task(task, job_id),
                         timeout=self.actor_config.episode_timeout_sec,
                     )
                 except asyncio.TimeoutError:
-                    hud_console.warning_log(f"Episode timed out for task {t.id}")
+                    hud_console.warning_log(f"Episode timed out for task {task.id}")
                     return Trace(isError=True, content="Episode timeout")
-
-            results = await asyncio.gather(
-                *[run_with_timeout(t) for t in batch],
-                return_exceptions=True,
-            )
-
-            # Normalize exceptions to error traces
-            for res in results:
-                if isinstance(res, Exception):
-                    hud_console.warning_log(f"Episode error: {res}")
-                    traces.append(Trace(isError=True, content=str(res)))
-                else:
-                    traces.append(res)
+                except Exception as e:
+                    hud_console.warning_log(f"Episode error for task {task.id}: {e}")
+                    return Trace(isError=True, content=str(e))
+        
+        # Run all tasks concurrently with semaphore limiting
+        results = await asyncio.gather(
+            *[run_with_semaphore(task) for task in tasks],
+            return_exceptions=True,
+        )
+        
+        # Normalize any remaining exceptions to error traces
+        traces = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                hud_console.warning_log(f"Unexpected error for task {tasks[i].id}: {result}")
+                traces.append(Trace(isError=True, content=str(result)))
+            else:
+                traces.append(result)
         
         return traces
     
@@ -107,16 +99,11 @@ class Actor:
         agent = self.create_agent()
         
         # Run the task
-        try:
-            with hud.trace(f"Training | {task.id}", job_id=job_id):
-                result = await agent.run(
-                    task,
-                    max_steps=self.actor_config.max_steps_per_episode
-                )
-
-        except Exception:
-            print("GOT EXCEPTION")
-            return Trace(isError=True)
+        with hud.trace(f"Training | {task.id}", job_id=job_id):
+            result = await agent.run(
+                task,
+                max_steps=self.actor_config.max_steps_per_episode
+            )
 
         result.info["tool_spec"] = agent.get_tool_schemas()
 
@@ -125,13 +112,13 @@ class Actor:
 
 if __name__ == "__main__":
     from hud.datasets import Task
+    import uuid
 
     async def test_actor():
         """Test the actor with a single 2048 task using local hud-browser image."""
         config = Config()
-        config.actor.max_parallel_episodes = 1
+        config.actor.max_parallel_episodes = 2
         config.actor.max_steps_per_episode = 6
-        config.actor.episode_timeout_sec = 120
         config.verbose = True
 
         # Create test task with local hud-browser image
@@ -141,7 +128,7 @@ if __name__ == "__main__":
             "mcp_config": {
                 "local": {
                     "command": "sh",
-                    "args": ["-c", "docker run --rm --platform linux/amd64 -i hud-browser:latest 2>/dev/null"]
+                    "args": ["-c", "docker run --rm --platform linux/amd64 -i hudevals/hud-browser:0.1.6 2>/dev/null"]
                 }
             },
             "setup_tool": {"name": "launch_app", "arguments": {"app_name": "2048"}},
@@ -150,6 +137,7 @@ if __name__ == "__main__":
                 "arguments": {"name": "game_2048_max_number", "arguments": {"target": 128}}
             },
             "system_prompt": "You are an expert 2048 game player. Use arrow keys to reach the target tile. First take a screenshot, then make strategic moves.",
+            "agent_tools": ["computer"],
         }
 
         task = Task(**task_data)
@@ -159,16 +147,8 @@ if __name__ == "__main__":
         print(f"Model: {config.model.base_model}")
         print(f"VLLM: {config.actor.vllm_base_url}\n")
 
-        traces = await actor.run_tasks([task], job_id="test_2048")
-
-        for trace in traces:
-            if trace.isError:
-                print(f"Error: {trace.content}")
-            else:
-                print("Success!")
-                print(f"Trace info: {trace.info if hasattr(trace, 'info') else 'No info'}")
-                # Check for evaluation in the trace info
-                if hasattr(trace, 'info') and 'evaluation' in trace.info:
-                    print(f"  Evaluation: {trace.info['evaluation']}")
+        job_id = str(uuid.uuid4())
+        with hud.job("Test Actor", job_id=job_id):
+            await actor.run_tasks([task]*5, job_id=job_id)
 
     asyncio.run(test_actor())
